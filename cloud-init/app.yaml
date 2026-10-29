@@ -1,0 +1,438 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - docker-compose
+  - git
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - jq
+
+write_files:
+  - path: /root/.ssh/github_backup_key
+    permissions: "0600"
+    content: |
+      ${GIT_HUB_SSH_PRIVATE_KEY}
+
+  - path: /opt/monitoring/.env
+    content: |
+      GF_SMTP_ENABLED=true
+      GF_SMTP_HOST=${smtp_host}
+      GF_SMTP_USER=${smtp_user_email}
+      GF_SMTP_PASSWORD=${smtp_password}
+      GF_SMTP_FROM_ADDRESS=${smtp_form_address_email}
+      GF_SMTP_FROM_NAME=Grafana Alerts
+      GF_SMTP_SKIP_VERIFY=true
+
+runcmd:
+  # Set floating IP
+  - |
+    cat > /etc/netplan/60-floating-ip.yaml << 'EOF'
+    network:
+        version: 2
+        ethernets:
+            eth0:
+                addresses:
+                - ${floating_ip}/32
+    EOF
+  - netplan apply
+
+  # Enable Docker & Nginx
+  - systemctl start docker
+  - systemctl enable docker
+  - systemctl enable nginx
+  - systemctl start nginx
+
+  # Create monitoring directory
+  - mkdir -p /opt/monitoring
+  - cd /opt/monitoring
+  - mkdir -p /opt/monitoring/tmp/loki/{index,chunks,boltdb-cache,wal,compactor}
+  - chown -R 10001:10001 /opt/monitoring/tmp/loki
+
+  - mkdir -p /opt/scripts
+
+  # Create required directories for Loki storage
+  - mkdir -p /opt/monitoring/tmp/loki/index
+  - mkdir -p /opt/monitoring/tmp/loki/chunks
+  - mkdir -p /opt/monitoring/tmp/loki/boltdb-cache
+  - mkdir -p /opt/monitoring/tmp/loki/wal
+  - mkdir -p /opt/monitoring/tmp/loki/compactor
+  - chown -R 10001:10001 /opt/monitoring/tmp/loki
+
+  # Write Prometheus config
+  - |
+    cat > /opt/monitoring/prometheus.yml <<'EOF'
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'mern_vm_node_exporters'
+        static_configs:
+          - targets: ['5.75.210.231:9100']
+            labels:
+              instance_name: 'falktron.com'
+              vm_ip: '5.75.210.231'
+
+          - targets: ['116.203.13.78:9100']
+            labels:
+              instance_name: 'msp.falktron.com'
+              vm_ip: '116.203.13.78'
+
+          - targets: ['116.202.189.167:9100']
+            labels:
+              instance_name: 'g.falktron.com'
+              vm_ip: '116.202.189.167'
+
+
+
+      - job_name: 'mern_vm_cadvisors'
+        static_configs:
+          - targets: ['5.75.210.231:8080']
+            labels:
+              instance_name: 'falktron.com'
+              vm_ip: '5.75.210.231'
+
+          - targets: ['116.203.13.78:8080']
+            labels:
+              instance_name: 'msp.falktron.com'
+              vm_ip: '116.203.13.78'
+
+          - targets: ['116.202.189.167:8080']
+            labels:
+              instance_name: 'g.falktron.com'
+              vm_ip: '116.202.189.167'
+    EOF
+
+  # Write Docker Compose config (preometheus, grafana, loki)
+  - |
+    cat > /opt/monitoring/docker-compose.yml <<EOF
+    version: '3'
+    services:
+      prometheus:
+        image: prom/prometheus
+        volumes:
+          - ./prometheus.yml:/etc/prometheus/prometheus.yml
+        command:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+        ports:
+          - '9090:9090'
+
+      grafana:
+        image: grafana/grafana
+        user: "472"
+        env_file:
+          - .env
+        volumes:
+          - /opt/grafana/dashboards:/var/lib/grafana/dashboards
+          - /opt/grafana/alerting:/var/lib/grafana/alerting
+          - /opt/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+          - /opt/grafana/provisioning/alerting:/etc/grafana/provisioning/alerting
+          - /opt/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+
+        environment:
+          - GF_SECURITY_ADMIN_USER=s.schweppe@falktron.com
+          - GF_SECURITY_ADMIN_PASSWORD=QdnhH0d#
+          - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/falktron-dashboard.json
+          - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=grafana-pyroscope-app 
+          - GF_UNIFIED_ALERTING_ENABLED=true
+        ports:
+          - '3000:3000'
+        depends_on:
+          - loki
+
+      loki:
+        image: grafana/loki:2.9.1
+        user: "10001"
+        ports:
+          - '3100:3100'
+        command: -config.file=/etc/loki/local-config.yaml
+        volumes:
+          - /opt/monitoring/loki-config.yaml:/etc/loki/local-config.yaml
+          - /opt/monitoring/tmp/loki/index:/tmp/loki/index
+          - /opt/monitoring/tmp/loki/chunks:/tmp/loki/chunks
+          - /opt/monitoring/tmp/loki/boltdb-cache:/tmp/loki/boltdb-cache
+          - /opt/monitoring/tmp/loki/wal:/tmp/loki/wal
+          - /opt/monitoring/tmp/loki/compactor:/tmp/loki/compactor
+    EOF
+
+  # Write basic Loki config
+  - |
+    cat > /opt/monitoring/loki-config.yaml <<EOF
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 0
+
+    ingester:
+      wal:
+        dir: /tmp/loki/wal
+      lifecycler:
+        ring:
+          kvstore:
+            store: inmemory
+          replication_factor: 1
+        final_sleep: 0s
+      chunk_idle_period: 5m
+      chunk_retain_period: 30s
+      max_transfer_retries: 0
+
+    schema_config:
+      configs:
+        - from: 2022-01-01
+          store: boltdb-shipper
+          object_store: filesystem
+          schema: v11
+          index:
+            prefix: index_
+            period: 24h
+
+    storage_config:
+      boltdb_shipper:
+        active_index_directory: /tmp/loki/index
+        cache_location: /tmp/loki/boltdb-cache
+        shared_store: filesystem
+      filesystem:
+        directory: /tmp/loki/chunks
+    compactor:
+      working_directory: /tmp/loki/compactor
+      shared_store: filesystem
+
+    limits_config:
+      enforce_metric_name: false
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+
+    chunk_store_config:
+      max_look_back_period: 0s
+
+    table_manager:
+      retention_deletes_enabled: true
+      retention_period: 168h
+    EOF
+
+  # Clone first (before Grafana container ever starts!)
+  - mkdir -p /root/.ssh
+  - chmod 700 /root/.ssh
+  - ssh-keyscan -H github.com >> /root/.ssh/known_hosts
+  - rm -rf /opt/grafana-src /opt/grafana
+  - GIT_SSH_COMMAND="ssh -i /root/.ssh/github_backup_key" git clone git@github.com:falktron-how/grafana-dashboards.git /opt/grafana-src
+
+  - mkdir -p /opt/grafana
+  - cp -r /opt/grafana-src/dashboards /opt/grafana/
+  - cp -r /opt/grafana-src/alerting /opt/grafana/
+  - cp -r /opt/grafana-src/provisioning /opt/grafana/
+  - cp -r /opt/grafana-src/backup /opt/grafana/
+  - chown -R 472:472 /opt/grafana
+  - chmod -R 775 /opt/grafana
+
+  # set permission for opt/grafana
+  - chown -R 472:472 /opt/grafana
+  - chmod -R 775 /opt/grafana
+
+  # Set permission for lib if exists
+  - mkdir -p /opt/grafana/lib
+  - chown -R 472:472 /opt/grafana/lib
+  - chmod -R 775 /opt/grafana/lib
+
+  # THEN start containers (important!)
+  - cd /opt/monitoring
+  - docker-compose up -d
+
+  # Sleep so Grafana can boot
+  - sleep 30
+  - mkdir -p /opt/scripts
+  # Write Grafana token generator
+  - |
+    echo "[i] Writing Grafana token generator script..."
+    cat <<'EOF' > /opt/scripts/create-grafana-token.sh
+    #!/bin/bash
+
+    # Check if API key already exists
+    if [ -f /opt/grafana/.api_key ]; then
+    echo "[✓] API key already exists. Skipping token creation."
+    exit 0
+    fi
+    # Create service account
+    echo "[i] Creating Grafana service account..."
+    SA_RESPONSE=$(curl -s -X POST http://localhost:3000/api/serviceaccounts \
+      -H "Content-Type: application/json" \
+      -u admin:supersecret \
+      -d '{"name": "backup-sa", "role": "Admin"}')
+
+    echo "[debug] SA_RESPONSE: $SA_RESPONSE" >&2
+    SA_ID=$(echo "$SA_RESPONSE" | jq -r '.id')
+
+    if [ "$SA_ID" != "null" ]; then
+      echo "[✓] Service account created with ID: $SA_ID"
+    else
+      echo "[x] Failed to create service account"
+      exit 1
+    fi
+
+    echo "[i] Creating token for service account..."
+    TOKEN_RESPONSE=$(curl -s -X POST http://localhost:3000/api/serviceaccounts/$SA_ID/tokens \
+      -H "Content-Type: application/json" \
+      -u admin:supersecret \
+      -d '{"name": "backup-token"}')
+
+    API_KEY=$(echo "$TOKEN_RESPONSE" | jq -r '.key')
+
+    if [ "$API_KEY" != "null" ]; then
+      echo "$API_KEY" > /opt/grafana/.api_key
+      echo "[✓] API key saved successfully."
+    else
+      echo "[x] Failed to generate API key"
+      exit 1
+    fi
+    EOF
+
+  - chmod +x /opt/scripts/create-grafana-token.sh
+
+  # Write Grafana exporter
+  - |
+    echo "[i] Writing Grafana exporter script..."
+    cat <<'EOF' > /opt/scripts/export-grafana.sh
+    #!/bin/bash
+
+    API_KEY=$(cat /opt/grafana/.api_key)
+    HOST="http://localhost:3000"
+
+    mkdir -p /opt/grafana/backup/{dashboards,alerting,datasources}
+
+    # Export dashboards
+    DASHBOARD_UIDS=$(curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/search?type=dash-db | jq -r '.[].uid')
+
+    for DASH_UID in $DASHBOARD_UIDS; do
+      TITLE=$(curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/dashboards/uid/$DASH_UID | jq -r '.dashboard.title' | sed 's/ /_/g')
+      curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/dashboards/uid/$DASH_UID \
+        | jq '.dashboard' > "/opt/grafana/backup/dashboards/$TITLE_$DASH_UID.json"
+    done
+
+    # Export alert rules
+    ALERT_GROUPS=$(curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/ruler/grafana/api/v1/rules | jq -r '.groups[].name')
+
+    for GROUP in $ALERT_GROUPS; do
+      curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/ruler/grafana/api/v1/rules/$GROUP \
+        > "/opt/grafana/backup/alerting/$GROUP.json"
+    done
+
+    # Export datasources
+    curl -s -H "Authorization: Bearer $API_KEY" $HOST/api/datasources \
+      > /opt/grafana/backup/datasources/all-datasources.json
+
+    echo "[✓] Grafana backup complete at $(date)" >> /var/log/grafana-backup.log
+    EOF
+
+  - chmod +x /opt/scripts/export-grafana.sh
+
+  # Cron job for backup
+  - bash /opt/scripts/create-grafana-token.sh
+  - cd /opt/grafana-src
+  - git config user.name "Grafana Backup Bot"
+  - git config user.email "backup@grafana.falktron.com"
+
+    # Write Grafana cron backup script
+  - |
+    cat <<'EOF' > /opt/scripts/grafana-backup.sh
+    #!/bin/bash
+
+    /opt/scripts/export-grafana.sh >> /var/log/grafana-cron.log 2>&1
+
+    rsync -a /opt/grafana/backup/ /opt/grafana-src/backup/ >> /var/log/grafana-cron.log 2>&1
+
+    cd /opt/grafana-src
+
+    cp -r dashboards alerting provisioning /opt/grafana
+
+    GIT_SSH_COMMAND="ssh -i /root/.ssh/github_backup_key" git add . >> /var/log/grafana-cron.log 2>&1
+
+    # Dynamic commit message
+    GIT_SSH_COMMAND="ssh -i /root/.ssh/github_backup_key" git commit -m "Auto backup: $(date '+%Y-%m-%d %H:%M:%S')" >> /var/log/grafana-cron.log 2>&1
+
+    GIT_SSH_COMMAND="ssh -i /root/.ssh/github_backup_key" git push origin main >> /var/log/grafana-cron.log 2>&1
+
+    EOF
+
+  - chmod +x /opt/scripts/grafana-backup.sh
+
+  # Add cron job that runs every 2 minutes
+  - |
+    echo '*/2 * * * * root bash /opt/scripts/grafana-backup.sh' > /etc/cron.d/grafana-backup
+  - chmod 644 /etc/cron.d/grafana-backup
+  # Nginx config for Grafana
+  - |
+    cat > /etc/nginx/sites-available/grafana <<EOF
+    server {
+        listen 80;
+        server_name grafana.falktron.com www.grafana.falktron.com;
+
+        location / {
+            proxy_pass http://localhost:3000;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+    EOF
+
+  # Nginx config for Prometheus
+  - |
+    cat > /etc/nginx/sites-available/prometheus <<EOF
+    server {
+        listen 80;
+        server_name prometheus.falktron.com www.prometheus.falktron.com;
+
+        location / {
+            proxy_pass http://localhost:9090;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+    EOF
+
+  # Nginx config for Loki
+  - |
+    cat > /etc/nginx/sites-available/loki <<EOF
+    server {
+        listen 80;
+        server_name loki.falktron.com www.loki.falktron.com;
+
+        location / {
+            proxy_pass http://localhost:3100;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+    }
+    EOF
+
+  # Enable Nginx sites
+  - ln -s /etc/nginx/sites-available/grafana /etc/nginx/sites-enabled/
+  - ln -s /etc/nginx/sites-available/prometheus /etc/nginx/sites-enabled/
+  - ln -s /etc/nginx/sites-available/loki /etc/nginx/sites-enabled/
+  - nginx -t && systemctl reload nginx
+
+  # Certbot SSL setup only for subdomains (Grafana, Prometheus, Loki)
+  - |
+    EMAIL="mnurullah@falktron.com"
+
+    if [ -f /etc/letsencrypt/live/grafana.falktron.com/fullchain.pem ]; then
+      echo "[✓] SSL already exists locally for grafana.falktron.com. Skipping certbot."
+    else
+      echo "[i] No local SSL found. Running certbot..."
+
+      certbot --nginx --non-interactive --agree-tos -m $EMAIL \
+        -d grafana.falktron.com \
+        -d prometheus.falktron.com \
+        -d loki.falktron.com
+    fi
+
+  # Enable certbot auto-renew every night at 3 AM
+  - echo "0 3 * * * root certbot renew --quiet && systemctl reload nginx" > /etc/cron.d/certbot-renew

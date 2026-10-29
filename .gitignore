@@ -1,0 +1,23 @@
+# Terraform providers, state, plans, and crash logs
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Local variable files can contain credentials
+*.tfvars
+*.tfvars.json
+
+# Local Terraform overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local secrets and editor settings
+.env
+*.pem
+*.key
+.vscode/
